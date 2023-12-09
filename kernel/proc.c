@@ -150,6 +150,7 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  p->tracemask=0;
 }
 
 // Create a user page table for a given process,
@@ -279,6 +280,9 @@ fork(void)
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
+  
+  //copy tracemask
+  np->tracemask=p->tracemask;
 
   // Cause fork to return 0 in the child.
   np->trapframe->a0 = 0;
@@ -693,3 +697,22 @@ procdump(void)
     printf("\n");
   }
 }
+
+uint64 acquire_nproc()
+{ 
+  struct proc *p;
+  int cnt=0;
+  for(p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if(p->state != UNUSED) {
+     	cnt++;
+     }
+     release(&p->lock);
+  }
+  return cnt;
+}
+
+
+
+
+
