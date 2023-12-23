@@ -28,7 +28,7 @@ procinit(void)
   struct proc *p;
   
   initlock(&pid_lock, "nextpid");
-  for(p = proc; p < &proc[NPROC]; p++) {
+  for(p = proc; p < &proc[NPROC]; p++) {//for each process
       initlock(&p->lock, "proc");
 
       // Allocate a page for the process's kernel stack.
@@ -113,6 +113,21 @@ found:
     return 0;
   }
 
+  // An empty user kpagetable.
+  p->kpagetable=ukvminit();
+  if(p->kpagetable == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+  //init user kpagetable
+  char *pa = kalloc();
+      if(pa == 0)
+        panic("kalloc");
+      uint64 va = KSTACK((int) (p - proc));
+      ukvmmap(p->kpagetable,va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+      p->kstack = va;
+  
   // An empty user page table.
   p->pagetable = proc_pagetable(p);
   if(p->pagetable == 0){
@@ -120,7 +135,7 @@ found:
     release(&p->lock);
     return 0;
   }
-
+  
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -141,7 +156,10 @@ freeproc(struct proc *p)
   p->trapframe = 0;
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
+  if(p->kpagetable)
+    kfreewalk(p->kpagetable);
   p->pagetable = 0;
+  p->kpagetable=0;
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -151,6 +169,26 @@ freeproc(struct proc *p)
   p->xstate = 0;
   p->state = UNUSED;
 }
+
+//add a way to free process kpagetable
+void
+kfreewalk(pagetable_t kpagetable)
+{
+  // there are 2^9 = 512 PTEs in a page table.
+  for(int i = 0; i < 512; i++){
+    pte_t pte = kpagetable[i];
+    if((pte & PTE_V)){
+      kpagetable[i] = 0;
+    if((pte & (PTE_R|PTE_W|PTE_X)) == 0){
+      // this PTE points to a lower-level page table.
+      uint64 child = PTE2PA(pte);
+      kfreewalk((pagetable_t)child);
+    } 
+  }
+ }
+ kfree((void*)kpagetable);
+}
+
 
 // Create a user page table for a given process,
 // with no user memory, but with trampoline pages.
@@ -220,11 +258,11 @@ userinit(void)
   // and data into it.
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
-
+  u2kvmcopy(p->pagetable, p->kpagetable, 0,p->sz);
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
   p->trapframe->sp = PGSIZE;  // user stack pointer
-
+  
   safestrcpy(p->name, "initcode", sizeof(p->name));
   p->cwd = namei("/");
 
@@ -242,13 +280,29 @@ growproc(int n)
   struct proc *p = myproc();
 
   sz = p->sz;
+  if(PGROUNDUP(sz + n) >= PLIC) return -1;
   if(n > 0){
-    if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+    if(sz + n > PLIC || (sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
     }
+      if(u2kvmcopy(p->pagetable, p->kpagetable, p->sz, sz) < 0){
+      return -1;
+    }
+    u2kvmcopy(p->pagetable,p->pagetable, sz-n, sz);
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
-  }
+    if (PGROUNDUP(sz) < PGROUNDUP(p->sz)) {
+      uvmunmap(p->kpagetable, PGROUNDUP(sz),
+               (PGROUNDUP(p->sz) - PGROUNDUP(sz)) / PGSIZE, 0);
+     }
+    }
+   
+   /*if (sz != p->sz) {
+      // change to kernel page table
+      uvmunmap(p->kpagetable,PGROUNDUP(sz),(PGROUNDUP(p->sz) - PGROUNDUP(sz)) / PGSIZE,0);
+    }
+  }*/
+  //kvminithart(); 
   p->sz = sz;
   return 0;
 }
@@ -274,7 +328,12 @@ fork(void)
     return -1;
   }
   np->sz = p->sz;
-
+  
+  if(u2kvmcopy(np->pagetable, np->kpagetable, 0, np->sz) < 0) {
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
   np->parent = p;
 
   // copy saved user registers.
@@ -288,7 +347,8 @@ fork(void)
     if(p->ofile[i])
       np->ofile[i] = filedup(p->ofile[i]);
   np->cwd = idup(p->cwd);
-
+  
+ 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
@@ -473,8 +533,10 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        w_satp(MAKE_SATP(p->kpagetable));
+        sfence_vma();
         swtch(&c->context, &p->context);
-
+	
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0;
@@ -484,6 +546,7 @@ scheduler(void)
       release(&p->lock);
     }
 #if !defined (LAB_FS)
+    kvminithart();
     if(found == 0) {
       intr_on();
       asm volatile("wfi");
