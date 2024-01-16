@@ -1,0 +1,5 @@
+1.li register save 13
+2.addi	a0,a0,1968//this letter call f(x)
+  sd	s0,8(sp)//this letter call g(x)
+3.printf is in ra+1536(sp+8+1536)
+4.ra save sp+8+1536 after printf
