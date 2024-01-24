@@ -125,13 +125,14 @@ sys_link(void)
   if(argstr(0, old, MAXPATH) < 0 || argstr(1, new, MAXPATH) < 0)
     return -1;
 
-  begin_op();
-  if((ip = namei(old)) == 0){
+  begin_op();//获取日志锁
+  if((ip = namei(old)) == 0){//Look up and return the inode for a path name.
     end_op();
     return -1;
   }
 
-  ilock(ip);
+  //避免多个进程同时修改inode导致的并发问题
+  ilock(ip);//get the inode lock
   if(ip->type == T_DIR){
     iunlockput(ip);
     end_op();
@@ -139,13 +140,13 @@ sys_link(void)
   }
 
   ip->nlink++;
-  iupdate(ip);
+  iupdate(ip);//更新inode
   iunlock(ip);
 
-  if((dp = nameiparent(new, name)) == 0)
+  if((dp = nameiparent(new, name)) == 0)//查找new的父目录和最终路径元素(文件)
     goto bad;
   ilock(dp);
-  if(dp->dev != ip->dev || dirlink(dp, name, ip->inum) < 0){
+  if(dp->dev != ip->dev || dirlink(dp, name, ip->inum) < 0){//在目录(dp)中添加一个新目录项，链接到指定的inode(inum)
     iunlockput(dp);
     goto bad;
   }
@@ -163,6 +164,59 @@ bad:
   iunlockput(ip);
   end_op();
   return -1;
+}
+uint64
+sys_symlink(void)
+{//在path处创建一个新的指向target的符号链接
+  char name[DIRSIZ],target[MAXPATH], path[MAXPATH];
+  struct inode *dp, *ip,*sym;
+
+  if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
+    return -1;
+
+  begin_op();//获取日志锁
+  if((ip = namei(target)) != 0){//Look up and return the inode for a path name.
+    ilock(ip);//get the inode lock //避免多个进程同时修改inode导致的并发问题
+    if(ip->type == T_DIR){
+      iunlockput(ip);
+      end_op();
+      return -1;
+    }
+    iunlockput(ip);
+  }
+
+  if((dp = nameiparent(path,name)) == 0){//查找new的父目录和最终路径元素(文件)
+    end_op();
+    return -1;  
+  };
+  ilock(dp);
+  if((sym=dirlookup(dp, name, 0)) !=0){//同名文件
+    iunlockput(dp);
+    end_op();
+    return -1;
+  }
+  
+  if((sym = ialloc(dp->dev, T_SYMLINK)) == 0)
+    panic("create: ialloc");
+
+  ilock(sym);
+  sym->nlink = 1;
+  iupdate(sym);
+
+  if(dirlink(dp, name, sym->inum) < 0)// 把符号链接文件加入到path的父目录中
+    panic("create: dirlink");
+
+  
+  if(writei(sym, 0, (uint64)&target, 0, strlen(target)) != strlen(target))//把target字符串写入符号链接文件里面
+    panic("symlink: writei");
+  
+  iupdate(dp);
+  iupdate(sym);
+  iunlockput(dp);
+  iunlockput(sym);
+  end_op();
+
+  return 0;
 }
 
 // Is the directory dp empty except for "." and ".." ?
@@ -287,9 +341,11 @@ uint64
 sys_open(void)
 {
   char path[MAXPATH];
+  char sympath[MAXPATH];
   int fd, omode;
   struct file *f;
   struct inode *ip;
+  struct inode *symip; 
   int n;
 
   if((n = argstr(0, path, MAXPATH)) < 0 || argint(1, &omode) < 0)
@@ -315,7 +371,33 @@ sys_open(void)
       return -1;
     }
   }
-
+  if(!(omode & O_NOFOLLOW) && ip->type == T_SYMLINK)
+  {
+    int time=0;
+    while(ip->type==T_SYMLINK)
+    {
+      if(readi(ip,0,(uint64)sympath,0,MAXPATH)==-1)
+      {
+        iunlockput(ip);
+        end_op();
+        return -1;
+      }
+      iunlockput(ip);
+      if ((symip=namei(sympath))==0)
+      {
+        end_op();
+        return -1;
+      }
+      time++;
+      if(time==10)
+      {
+        end_op();
+        return -1;
+      }
+      ip=symip;
+      ilock(ip);
+    }
+  }
   if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){
     iunlockput(ip);
     end_op();
