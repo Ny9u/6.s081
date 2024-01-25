@@ -121,7 +121,7 @@ sys_link(void)
 {
   char name[DIRSIZ], new[MAXPATH], old[MAXPATH];
   struct inode *dp, *ip;
-
+  //系统调用参数拷贝到old和new
   if(argstr(0, old, MAXPATH) < 0 || argstr(1, new, MAXPATH) < 0)
     return -1;
 
@@ -133,9 +133,9 @@ sys_link(void)
 
   //避免多个进程同时修改inode导致的并发问题
   ilock(ip);//get the inode lock
-  if(ip->type == T_DIR){
-    iunlockput(ip);
-    end_op();
+  if(ip->type == T_DIR){//判断inode类型
+    iunlockput(ip); //release the small lock
+    end_op();// release the big lock
     return -1;
   }
 
@@ -146,12 +146,12 @@ sys_link(void)
   if((dp = nameiparent(new, name)) == 0)//查找new的父目录和最终路径元素(文件)
     goto bad;
   ilock(dp);
-  if(dp->dev != ip->dev || dirlink(dp, name, ip->inum) < 0){//在目录(dp)中添加一个新目录项，链接到指定的inode(inum)
+  if(dp->dev != ip->dev || dirlink(dp, name, ip->inum) < 0){//检查父目录和文件是否在同一设备上,并在父目录中查找name
     iunlockput(dp);
     goto bad;
   }
   iunlockput(dp);
-  iput(ip);
+  iput(ip);//decrease the ref of ip
 
   end_op();
 
@@ -167,55 +167,56 @@ bad:
 }
 uint64
 sys_symlink(void)
-{//在path处创建一个新的指向target的符号链接
-  char name[DIRSIZ],target[MAXPATH], path[MAXPATH];
-  struct inode *dp, *ip,*sym;
-
+{
+  char name[DIRSIZ], target[MAXPATH], path[MAXPATH];
+  struct inode *dp, *ip,*symip;
+  //系统调用参数拷贝到old和new
   if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
     return -1;
 
   begin_op();//获取日志锁
   if((ip = namei(target)) != 0){//Look up and return the inode for a path name.
-    ilock(ip);//get the inode lock //避免多个进程同时修改inode导致的并发问题
-    if(ip->type == T_DIR){
-      iunlockput(ip);
-      end_op();
+    //检查软链接指向的inode的性质
+    ilock(ip);//get the inode lock
+    if(ip->type == T_DIR){//判断inode类型
+      iunlockput(ip); //release the small lock
+      end_op();// release the big lock
       return -1;
-    }
-    iunlockput(ip);
+    } 
+    iunlock(ip);
   }
-
-  if((dp = nameiparent(path,name)) == 0){//查找new的父目录和最终路径元素(文件)
+  //允许namei==0(inode不存在)
+  if((dp = nameiparent(path, name)) == 0){//查找new的父目录和最终路径元素(文件)
     end_op();
-    return -1;  
-  };
+    return -1;
+  }
   ilock(dp);
-  if((sym=dirlookup(dp, name, 0)) !=0){//同名文件
+  if(dirlookup(dp, name, 0) != 0){//在父目录中查找name
     iunlockput(dp);
     end_op();
     return -1;
   }
-  
-  if((sym = ialloc(dp->dev, T_SYMLINK)) == 0)
+  //生成软链接文件
+  if((symip = ialloc(dp->dev, T_SYMLINK)) == 0)
     panic("create: ialloc");
+  //初始化软链接文件
+  ilock(symip);
+  symip->nlink = 1;
 
-  ilock(sym);
-  sym->nlink = 1;
-  iupdate(sym);
-
-  if(dirlink(dp, name, sym->inum) < 0)// 把符号链接文件加入到path的父目录中
-    panic("create: dirlink");
-
-  
-  if(writei(sym, 0, (uint64)&target, 0, strlen(target)) != strlen(target))//把target字符串写入符号链接文件里面
+  //将target文件的路径拷贝到软链接
+  if(writei(symip, 0, (uint64)&target, 0, strlen(target)) != strlen(target))//把target字符串写入符号链接文件里面
     panic("symlink: writei");
+
+  //将软链接文件写入父目录
+  if(dirlink(dp, name, symip->inum) < 0)
+    panic("create: dirlink");
   
   iupdate(dp);
-  iupdate(sym);
-  iunlockput(dp);
-  iunlockput(sym);
+  iupdate(symip);
+  iunlockput(dp); 
+  iunlockput(symip);
+  
   end_op();
-
   return 0;
 }
 
@@ -352,7 +353,6 @@ sys_open(void)
     return -1;
 
   begin_op();
-
   if(omode & O_CREATE){
     ip = create(path, T_FILE, 0, 0);
     if(ip == 0){
@@ -371,8 +371,8 @@ sys_open(void)
       return -1;
     }
   }
-  if(!(omode & O_NOFOLLOW) && ip->type == T_SYMLINK)
-  {
+  //打开软链接
+  if(ip->type == T_SYMLINK &&!(omode & O_NOFOLLOW)){
     int time=0;
     while(ip->type==T_SYMLINK)
     {
@@ -388,16 +388,17 @@ sys_open(void)
         end_op();
         return -1;
       }
+      ip=symip;
       time++;
-      if(time==10)
+      if (time==10)
       {
         end_op();
         return -1;
       }
-      ip=symip;
       ilock(ip);
     }
   }
+   //为打开的文件分配文件结构体(file)和文件描述符(fd)
   if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){
     iunlockput(ip);
     end_op();
